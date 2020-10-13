@@ -204,9 +204,9 @@ func NewGrpcForServers(ctx context.Context, cfg Config, servers []Registrar) (s 
 		//	*keyFile = testdata.Path("server1.key")
 		//}
 		//creds, err := credentials.NewServerTLSFromFile(*certFile, *keyFile)
-		creds, err := credentials.NewServerTLSFromFile(testdata.Path("server1.pem"), testdata.Path("server1.key"))
-		if err != nil {
-			err = errors.Wrap(err, "failed to generate credentials")
+		creds, creadErr := credentials.NewServerTLSFromFile(testdata.Path("server1.pem"), testdata.Path("server1.key"))
+		if creadErr != nil {
+			err = errors.Wrap(creadErr, "failed to generate credentials")
 			return
 		}
 		opts = append(opts, grpc.Creds(creds))
