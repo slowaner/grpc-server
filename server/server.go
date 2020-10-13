@@ -3,66 +3,131 @@ package server
 import (
 	"context"
 	"fmt"
-	"github.com/improbable-eng/grpc-web/go/grpcweb"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/testdata"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
-)
 
-type Registrar interface {
-	Register(ctx context.Context, grpcServer *grpc.Server) error
-}
+	"github.com/improbable-eng/grpc-web/go/grpcweb"
+	"github.com/pkg/errors"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/testdata"
+)
 
 type Server struct {
 	*grpc.Server
+	config   Config
+	stopChan chan bool
 }
 
-func NewGrpcForServers(servers []Registrar) (*Server, error) {
-	var opts []grpc.ServerOption
-	// TODO: make gRPC via tls
-	//if *tls {
-	//	if *certFile == "" {
-	//		*certFile = testdata.Path("server1.pem")
-	//	}
-	//	if *keyFile == "" {
-	//		*keyFile = testdata.Path("server1.key")
-	//	}
-	//	creds, err := credentials.NewServerTLSFromFile(*certFile, *keyFile)
-	//creds, err := credentials.NewServerTLSFromFile(testdata.Path("server1.pem"), testdata.Path("server1.key"))
-	//if err != nil {
-	//	log.Fatalf("Failed to generate credentials %v", err)
-	//}
-	//opts = append(opts, grpc.Creds(creds))
-	//}
-	grpcServer := grpc.NewServer(opts...)
-	for _, srv := range servers {
-		err := srv.Register(nil, grpcServer)
-		if err != nil {
-			return nil, err
-		}
+func (s *Server) Serve() (ec <-chan error) {
+	errChan := make(chan error, 1)
+	ec = errChan
+
+	if s.stopChan != nil {
+		errChan <- errors.New("already started")
+		close(errChan)
+		return
 	}
 
-	return &Server{grpcServer}, nil
+	s.stopChan = make(chan bool)
+
+	grpcErrChan := s.serveGrpc(s.stopChan)
+	httpErrChan := s.serveHttp(s.stopChan)
+
+	wg := sync.WaitGroup{}
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		for err := range httpErrChan {
+			errChan <- err
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		for err := range grpcErrChan {
+			errChan <- err
+		}
+	}()
+
+	go func() {
+		wg.Wait()
+		close(errChan)
+	}()
+
+	return
 }
 
-func (srv *Server) Serve() chan error {
-	errChan := make(chan error, 1)
+func (s *Server) serveGrpc(stopChan <-chan bool) (ec <-chan error) {
+	errChan := make(chan error, 2)
+	ec = errChan
 
-	enableTls := true
-	lis, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", 24560))
+	if !s.config.GrpcEnable {
+		close(errChan)
+		return
+	}
+
+	lis, err := net.Listen("tcp", fmt.Sprintf("%s:%d", s.config.GrpcHost, s.config.GrpcPort))
 	if err != nil {
 		errChan <- err
 		close(errChan)
-		return errChan
+		return
 	}
 
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		defer close(signalChan)
+
+		select {
+		case <-signalChan:
+		case <-stopChan:
+		}
+
+		s.Server.GracefulStop()
+	}()
+
+	go func() {
+		defer close(errChan)
+
+		errChan <- s.Server.Serve(lis)
+	}()
+
+	return
+}
+
+func (s *Server) serveHttp(stopChan <-chan bool) (ec <-chan error) {
+	errChan := make(chan error, 2)
+	ec = errChan
+
+	if !s.config.WebEnable {
+		close(errChan)
+		return
+	}
+
+	listenErrChan := make(chan error, 1)
+	stopErrChan := make(chan error, 1)
+
+	go func() {
+		defer close(errChan)
+
+		for err := range listenErrChan {
+			errChan <- err
+		}
+		for err := range stopErrChan {
+			errChan <- err
+		}
+	}()
+
 	wrappedServer := grpcweb.WrapServer(
-		srv.Server,
+		s.Server,
 		grpcweb.WithOriginFunc(func(origin string) bool {
 			return true
 		}),
@@ -82,66 +147,81 @@ func (srv *Server) Serve() chan error {
 	}
 
 	httpServer := http.Server{
-		Addr:    fmt.Sprintf(":%d", 9090),
+		Addr:    fmt.Sprintf("%s:%d", s.config.WebHost, s.config.WebPort),
 		Handler: http.HandlerFunc(handler),
 	}
 
 	signalChan := make(chan os.Signal, 1)
-	grpcSignalChan := make(chan os.Signal, 1)
-	grpcErrChan := make(chan error, 1)
-	srvErrChan := make(chan error, 1)
-	srvStopErrChan := make(chan error, 1)
-
-	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
-	signal.Notify(grpcSignalChan, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
-		<-signalChan
+		defer close(signalChan)
+		defer close(stopErrChan)
+
+		select {
+		case <-signalChan:
+		case <-stopChan:
+		}
+
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := httpServer.Shutdown(ctx); err != nil {
-			srvStopErrChan <- err
+			stopErrChan <- err
 		}
-		close(srvStopErrChan)
-	}()
-	go func() {
-		<-grpcSignalChan
-		srv.Server.Stop()
-	}()
-	go func() {
-		for err := range srvErrChan {
-			errChan <- err
-		}
-		for err := range grpcErrChan {
-			errChan <- err
-		}
-		for err := range srvStopErrChan {
-			errChan <- err
-		}
-		close(errChan)
 	}()
 
-	if enableTls {
+	if s.config.WebEnableTls {
 		go func() {
+			defer close(listenErrChan)
+
+			// TODO: tls
 			err := httpServer.ListenAndServeTLS(testdata.Path("server1.pem"), testdata.Path("server1.key"))
 			if err != http.ErrServerClosed {
-				srvErrChan <- err
+				listenErrChan <- err
 			}
-			close(srvErrChan)
 		}()
 	} else {
 		go func() {
+			defer close(listenErrChan)
+
 			err := httpServer.ListenAndServe()
 			if err != http.ErrServerClosed {
-				srvErrChan <- err
+				listenErrChan <- err
 			}
-			close(srvErrChan)
 		}()
 	}
 
-	go func() {
-		grpcErrChan <- srv.Server.Serve(lis)
-		close(grpcErrChan)
-	}()
+	return
+}
 
-	return errChan
+func NewGrpcForServers(ctx context.Context, cfg Config, servers []Registrar) (s *Server, err error) {
+	var opts []grpc.ServerOption
+	// TODO: tls
+	if cfg.GrpcEnableTls {
+		//if *certFile == "" {
+		//	*certFile = testdata.Path("server1.pem")
+		//}
+		//if *keyFile == "" {
+		//	*keyFile = testdata.Path("server1.key")
+		//}
+		//creds, err := credentials.NewServerTLSFromFile(*certFile, *keyFile)
+		creds, err := credentials.NewServerTLSFromFile(testdata.Path("server1.pem"), testdata.Path("server1.key"))
+		if err != nil {
+			err = errors.Wrap(err, "failed to generate credentials")
+			return
+		}
+		opts = append(opts, grpc.Creds(creds))
+	}
+	grpcServer := grpc.NewServer(opts...)
+	for _, srv := range servers {
+		err = srv.Register(ctx, grpcServer)
+		if err != nil {
+			return
+		}
+	}
+
+	s = &Server{
+		Server: grpcServer,
+		config: cfg,
+	}
+	return
 }
