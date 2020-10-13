@@ -7,7 +7,7 @@ type Config struct {
 	// Grpc listening host
 	GrpcHost string
 	// Grpc listening port
-	GrpcPort uint8
+	GrpcPort uint16
 	// Enable grpc listening via tls
 	GrpcEnableTls bool
 
@@ -16,7 +16,7 @@ type Config struct {
 	// Grpc-web listening host
 	WebHost string
 	// Grpc-web listening port
-	WebPort uint8
+	WebPort uint16
 	// Enable grpc-web listening via tls
 	WebEnableTls bool
 }
